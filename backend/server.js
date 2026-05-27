@@ -8,7 +8,17 @@ const { initDb } = require("./db");
 const app = express();
 const server = http.createServer(app);
 
+// ─────────────────────────────────────────────
+// ENV
+// ─────────────────────────────────────────────
+
+const PORT = process.env.PORT || 4000;
+
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:5173";
+
+// ─────────────────────────────────────────────
+// SOCKET.IO
+// ─────────────────────────────────────────────
 
 const io = new Server(server, {
   cors: {
@@ -17,36 +27,73 @@ const io = new Server(server, {
   },
 });
 
-app.use(cors({ origin: CLIENT_URL }));
+// ─────────────────────────────────────────────
+// MIDDLEWARE
+// ─────────────────────────────────────────────
+
+app.use(
+  cors({
+    origin: CLIENT_URL,
+    credentials: true,
+  })
+);
+
 app.use(express.json());
 
-app.get("/health", (_, res) => {
-  res.json({ ok: true });
+// ─────────────────────────────────────────────
+// ROOT ROUTE
+// ─────────────────────────────────────────────
+
+app.get("/", (_, res) => {
+  res.send("SkillFlow Backend Running");
 });
 
-// ─────────────────────────────────────────────────────
-// START SERVER AFTER DATABASE INITIALIZES
-// ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// HEALTH CHECK
+// ─────────────────────────────────────────────
+
+app.get("/health", (_, res) => {
+  res.json({
+    ok: true,
+    message: "SkillFlow backend healthy",
+  });
+});
+
+// ─────────────────────────────────────────────
+// START SERVER
+// ─────────────────────────────────────────────
 
 async function startServer() {
   try {
-    // Initialize DB first
+    // Initialize Database
+
     await initDb();
 
     console.log("Database initialized");
 
     // Routes
+
     app.use("/api/auth", require("./routes/auth"));
     app.use("/api/sessions", require("./routes/sessions"));
     app.use("/api/comments", require("./routes/comments"));
 
-    // ─────────────────────────────────────────────────
-    // WebRTC + Socket.io
-    // ─────────────────────────────────────────────────
+    // ─────────────────────────────────────────
+    // ROOMS
+    // ─────────────────────────────────────────
 
     const rooms = new Map();
 
+    // ─────────────────────────────────────────
+    // SOCKET CONNECTION
+    // ─────────────────────────────────────────
+
     io.on("connection", (socket) => {
+      console.log("User connected:", socket.id);
+
+      // ───────────────────────────────────────
+      // HOST JOIN
+      // ───────────────────────────────────────
+
       socket.on("host:join", ({ sessionId, user }) => {
         if (!rooms.has(sessionId)) {
           rooms.set(sessionId, {
@@ -59,6 +106,7 @@ async function startServer() {
         const room = rooms.get(sessionId);
 
         room.hostSocketId = socket.id;
+
         room.userMap.set(socket.id, user);
 
         socket.join(sessionId);
@@ -66,7 +114,13 @@ async function startServer() {
         socket.emit("host:ready", {
           viewerCount: room.viewers.size,
         });
+
+        console.log("Host joined:", sessionId);
       });
+
+      // ───────────────────────────────────────
+      // VIEWER JOIN
+      // ───────────────────────────────────────
 
       socket.on("viewer:join", ({ sessionId, user }) => {
         const room = rooms.get(sessionId);
@@ -78,6 +132,7 @@ async function startServer() {
         }
 
         room.viewers.add(socket.id);
+
         room.userMap.set(socket.id, user);
 
         socket.join(sessionId);
@@ -94,9 +149,13 @@ async function startServer() {
         global.__db
           .prepare("UPDATE sessions SET viewer_count = ? WHERE id = ?")
           .run(room.viewers.size, sessionId);
+
+        console.log("Viewer joined:", sessionId);
       });
 
-      // WebRTC Signaling
+      // ───────────────────────────────────────
+      // WEBRTC SIGNALING
+      // ───────────────────────────────────────
 
       socket.on("webrtc:offer", ({ viewerId, offer }) => {
         io.to(viewerId).emit("webrtc:offer", {
@@ -119,7 +178,9 @@ async function startServer() {
         });
       });
 
-      // Chat
+      // ───────────────────────────────────────
+      // CHAT
+      // ───────────────────────────────────────
 
       socket.on("chat:message", ({ sessionId, message, user }) => {
         io.to(sessionId).emit("chat:message", {
@@ -130,7 +191,9 @@ async function startServer() {
         });
       });
 
-      // End Session
+      // ───────────────────────────────────────
+      // SESSION END
+      // ───────────────────────────────────────
 
       socket.on("session:end", ({ sessionId }) => {
         io.to(sessionId).emit("session:ended");
@@ -139,14 +202,26 @@ async function startServer() {
 
         global.__db
           .prepare(
-            "UPDATE sessions SET status='ended', ended_at=datetime('now') WHERE id=?"
+            `
+            UPDATE sessions
+            SET
+              status='ended',
+              ended_at=datetime('now')
+            WHERE id=?
+            `
           )
           .run(sessionId);
+
+        console.log("Session ended:", sessionId);
       });
 
-      // Disconnect
+      // ───────────────────────────────────────
+      // DISCONNECT
+      // ───────────────────────────────────────
 
       socket.on("disconnect", () => {
+        console.log("User disconnected:", socket.id);
+
         rooms.forEach((room, sessionId) => {
           // Host disconnected
 
@@ -157,9 +232,17 @@ async function startServer() {
 
             global.__db
               .prepare(
-                "UPDATE sessions SET status='ended', ended_at=datetime('now') WHERE id=?"
+                `
+                UPDATE sessions
+                SET
+                  status='ended',
+                  ended_at=datetime('now')
+                WHERE id=?
+                `
               )
               .run(sessionId);
+
+            console.log("Host disconnected:", sessionId);
           }
 
           // Viewer disconnected
@@ -177,18 +260,24 @@ async function startServer() {
             });
 
             global.__db
-              .prepare("UPDATE sessions SET viewer_count = ? WHERE id = ?")
+              .prepare(
+                `
+                UPDATE sessions
+                SET viewer_count = ?
+                WHERE id = ?
+                `
+              )
               .run(room.viewers.size, sessionId);
+
+            console.log("Viewer left:", sessionId);
           }
         });
       });
     });
 
-    // ─────────────────────────────────────────────────
-    // Start HTTP Server
-    // ─────────────────────────────────────────────────
-
-    const PORT = process.env.PORT || 4000;
+    // ─────────────────────────────────────────
+    // START LISTENING
+    // ─────────────────────────────────────────
 
     server.listen(PORT, () => {
       console.log(`SkillFlow server running on port ${PORT}`);
